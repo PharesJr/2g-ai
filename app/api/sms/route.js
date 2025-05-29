@@ -1,4 +1,3 @@
-// app/api/sms/route.js
 import "dotenv/config";
 import { sendSMS } from "../../../utils/sendSms";
 import ModelClient, { isUnexpected } from "@azure-rest/ai-inference";
@@ -7,24 +6,37 @@ import { AzureKeyCredential } from "@azure/core-auth";
 // Initialize AI Model Client
 const token = process.env["GITHUB_TOKEN"];
 const endpoint = "https://models.github.ai/inference";
-const model = "deepseek/DeepSeek-V3-0324";
+const model = "meta/Llama-4-Scout-17B-16E-Instruct";
 const client = ModelClient(endpoint, new AzureKeyCredential(token));
+
+// In-memory store for conversation history
+const conversationStore = new Map();
 
 // Function to count words
 const countWords = (text) => text.trim().split(/\s+/).length;
 
-// Function to trim response to meet constraints
-const trimResponse = (text, maxWords = 45, maxChars = 200) => {
+// Function to split and trim response to meet SMS constraints
+const trimResponse = (text, maxWords = 45, maxCharsPerPart = 153) => {
   let result = text.replace(/[\r\n]+/g, " ").replace(/[^ -~]/g, ""); // Remove line breaks and non-ASCII
-  // Trim to maxChars
-  result = result.substring(0, maxChars);
-  // Ensure word count is under maxWords
-  while (countWords(result) > maxWords && result.length > 0) {
-    const lastSpace = result.lastIndexOf(" ", maxChars - 1);
-    if (lastSpace === -1) break;
-    result = result.substring(0, lastSpace);
+  const parts = [];
+  let remaining = result;
+
+  // Split into parts of maxCharsPerPart, respecting word boundaries
+  while (remaining.length > 0 && countWords(remaining) > 0) {
+    let part = remaining.substring(0, maxCharsPerPart);
+    if (countWords(part) > maxWords) {
+      // Trim to maxWords within this part
+      while (countWords(part) > maxWords && part.length > 0) {
+        const lastSpace = part.lastIndexOf(" ", maxCharsPerPart - 1);
+        if (lastSpace === -1) break;
+        part = part.substring(0, lastSpace);
+      }
+    }
+    parts.push(part.trim());
+    remaining = remaining.substring(part.length).trim();
   }
-  return result.trim();
+
+  return parts.length > 0 ? parts : ["Unable to generate a clear response."];
 };
 
 export async function POST(req) {
@@ -54,29 +66,35 @@ export async function POST(req) {
       });
     }
 
-    // Query the AI model with stricter prompt
+    // Get conversation history for the user
+    const userId = from;
+    const previousMessages = conversationStore.get(userId) || [];
+    const userMessages = previousMessages
+      .filter((msg) => msg.role === "user")
+      .slice(-3); // Keep last 3 user messages
+    const messages = [
+      {
+        role: "system",
+        content:
+          "You are a friendly, concise SMS chatbot. Respond in under 45 words using simple, clear language suitable for SMS. Avoid greetings or extra phrases.",
+      },
+      ...userMessages,
+      { role: "user", content: text },
+    ];
+
+    // Query the AI model
     const aiResponse = await client.path("/chat/completions").post({
       body: {
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a concise assistant. Respond in under 45 words and 200 characters. Be clear, factual, and to the point. Avoid greetings or extra phrases.",
-          },
-          {
-            role: "user",
-            content: text, // Directly use the user's text
-          },
-        ],
-        temperature: 0.3, // Lower temperature for more predictable, concise output
-        top_p: 0.9, // Slightly reduce randomness
+        messages,
+        temperature: 0.1, // More deterministic output
+        top_p: 0.9,
         model: model,
-        max_tokens: 50, // Tighter token limit (~200 chars, assuming ~4 chars/token)
+        max_tokens: 60, // Allow slightly longer responses
       },
     });
 
     if (isUnexpected(aiResponse)) {
-      console.error("AI Model Error:", aiResponse.body.error);
+      console.error(`AI Error for ID ${body.id}:`, aiResponse.body.error);
       await sendSMS({
         to: from,
         message: "Error processing your query. Please try again.",
@@ -91,27 +109,43 @@ export async function POST(req) {
     let reply =
       aiResponse.body.choices[0]?.message.content || "No response from AI.";
 
-    // Trim and validate response
-    reply = trimResponse(reply, 45, 200);
+    // Trim and split response into parts
+    const replyParts = trimResponse(reply, 45, 153);
 
-    // If reply is empty or too short, use a fallback
-    if (reply.length < 10 || countWords(reply) < 5) {
-      reply = "Unable to generate a clear response.";
+    // If all parts are too short or empty, use a fallback
+    if (replyParts.every((part) => part.length < 10 || countWords(part) < 5)) {
+      replyParts.splice(
+        0,
+        replyParts.length,
+        "Unable to generate a clear response."
+      );
     }
 
-    // Send AI response back to user via SMS
-    await sendSMS({
-      to: from,
-      message: reply,
-      from: body.to,
-    });
+    // Update conversation history with the full response
+    conversationStore.set(
+      userId,
+      [
+        ...userMessages,
+        { role: "user", content: text },
+        { role: "assistant", content: replyParts.join(" ") },
+      ].slice(-4)
+    ); // Store up to 4 messages (3 user + 1 assistant)
+
+    // Send each part as a separate SMS
+    for (const part of replyParts) {
+      await sendSMS({
+        to: from,
+        message: part,
+        from: body.to,
+      });
+    }
 
     return new Response("SMS processed", {
       status: 200,
       headers: { "Content-Type": "text/plain" },
     });
   } catch (error) {
-    console.error("Error processing SMS request:", error);
+    console.error(`Error for ID ${body?.id}:`, error);
     if (body?.from && body?.to) {
       await sendSMS({
         to: body.from,
