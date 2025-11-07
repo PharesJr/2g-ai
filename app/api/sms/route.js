@@ -6,7 +6,7 @@ import { AzureKeyCredential } from "@azure/core-auth";
 // Initialize AI Model Client
 const token = process.env["GITHUB_TOKEN"];
 const endpoint = "https://models.github.ai/inference";
-const model = "meta/Llama-4-Scout-17B-16E-Instruct";
+const model = "openai/gpt-5";
 const client = ModelClient(endpoint, new AzureKeyCredential(token));
 
 // In-memory store for conversation history
